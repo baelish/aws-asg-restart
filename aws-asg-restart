@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+#
+# This script restarts each instance in an auto-scaling group, one at a time, removing the instance from the ELB as it goes
+#
+
+set -euo pipefail
+IFS=$'\n\t'
+
+logEntry() {
+    level="${1^^}"
+    shift
+
+    if [[ -z "${DEBUG:-}" && "$level" == "DEBUG" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${QUIET:-}" && "$level" == "INFO" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${LOGFILE:-}" ]]; then
+        # write to log
+        $dateTime="$(date +%Y%m%dT%H%M%S%z)"
+        echo "$dateTime $level $@" >> "$LOGFILE"
+    else
+        # print to screen
+        echo "$level: $@"
+    fi
+}
+
+
+
+#The name of the auto-scaling grpup
+autoScalingGroup="${1:-}"
+
+delay=300
+
+
+if [[ -z "$autoScalingGroup" ]]; then
+    logEntry "error" "Must supply an auto scaling group as the first argument"
+
+    exit 1
+fi
+
+# Fetch details about the ASG
+instances=($(aws autoscaling describe-auto-scaling-instances --output text --query "AutoScalingInstances[?AutoScalingGroupName == '${autoScalingGroup}'].{InstanceId:InstanceId}"))
+
+#Check the ASG exists
+if [[ -z "${instances[0]:-}" ]]; then
+    logEntry "error" "Auto-scaling group \"${autoScalingGroup}\" does not exist"
+
+    exit 1
+fi
+
+logEntry "debug" "instances[@]: " "${instances[@]}"
+
+
+# Loop over each instance
+for instance in "${instances[@]}" ; do
+    logEntry "info" "Processing $instance"
+
+    elbName="$(aws elb describe-load-balancers --output text --query "LoadBalancerDescriptions[? Instances[? InstanceId == '${instance}']].{LoadBalancerName:LoadBalancerName}")"
+    logEntry "debug" "ELB name = " "$elbName"
+    # Remove instance from ELB
+    logEntry "info" "Removing ${instance} from ${elbName}"
+    output="$(aws elb deregister-instances-from-load-balancer --load-balancer-name "${elbName}" --instances "${instance}")"
+    logEntry "debug" "$output"
+    sleep 2
+
+    # Wait for the instance to be removed from ELB
+    logEntry "debug" "Waiting for ${instance} to be removed from ${elbName}"
+    while [[ "$(aws elb describe-instance-health --load-balancer-name "${elbName}" --output text --query "InstanceStates[? InstanceId == '${instance}'].{State:State}")" == "InService" ]]; do
+        sleep 2
+
+        if [[ -z "$QUIET" && -z "$LOGFILE" ]]; then
+            echo -n "."
+        fi
+    done
+
+    # Terminate the instance
+    logEntry "info" "Terminating ${instance}"
+    output="$(aws ec2 terminate-instances --instance-ids "${instance}")"
+    logEntry "debug" "$output"
+
+    # Wait for ASG to recover before killing the next server
+    logEntry "info" "Sleeping for ${delay} seconds whilst the ASG recovers"
+    sleep "${delay}"
+done
+
